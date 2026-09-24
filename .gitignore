@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Audio & Video temporary files
+*.wav
+*.mp4
+*.mkv
+*.mov
+*.avi
+
+# Output transcription files (keep repository clean)
+*_文字起こし.txt
+*_文字起こし.md
+temp_*.wav
+
+# System / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,25 @@
+Whisperを使った音声認識＋文字起こしアプリを作成したいです。
+
+参考URL
+https://note.com/yaoyoroztech/n/na2a5befafa89
+
+
+#目的
+いままで撮影した　mp4形式のファイルがあります。
+こちらの文字起こしを行いたいです。
+
+まずはpythonのコマンドラインプログラムでOKです。
+プログラムに動画のmp4ファイルを指定したら　日本語で文字起こしされた内容をテキストで出力してください。
+
+OpenAIのWhipser　動画から音声ファイルWav形式の抽出は　ffmpegを利用します。
+
+このPC Intel Ultra7　258V で　Local AI  LLM OpenVINOを動作させたいです。
+メモリは32GB搭載しています。
+
+文字起こしした内容は、このあと、Gemni（NotebookLM）で議事録と要約を作成する予定です。
+
+
+
+
+
+
