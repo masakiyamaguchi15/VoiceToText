@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 OpenVINO Local AI Whisper 音声認識・文字起こしスクリプト
-Intel Core Ultra (Lunar Lake / Meteor Lake) 最適化版
+Intel Core Ultra (Lunar Lake / Meteor Lake) & AMD Ryzen (マルチコア CPU) 両対応版
 
 機能:
 1. MP4 などの動画ファイルから ffmpeg を用いて 16kHz モノラル WAV 音声を抽出
 2. OpenVINO GenAI (WhisperPipeline) を使い GPU / NPU / CPU で高速ローカル文字起こし
+   - Intel 機: Intel Arc GPU (または NPU / CPU) を自動検出・活用
+   - AMD 機: Ryzen マルチコア CPU を自動選択し安定・高速動作
 3. タイムスタンプ付きのテキストおよび Markdown ファイルを出力 (NotebookLM / Gemini 議事録作成に最適化)
 """
 
@@ -29,11 +31,52 @@ from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 try:
+    import openvino as ov
     import openvino_genai as ov_genai
 except ImportError:
-    print("エラー: openvino_genai がインストールされていません。")
+    print("エラー: openvino または openvino_genai がインストールされていません。")
     print("`pip install openvino-genai openvino-tokenizers openvino` を実行してください。")
     sys.exit(1)
+
+
+def resolve_device(requested_device: str = "AUTO") -> str:
+    """
+    実行環境に応じた最適なデバイスを判定
+    - AUTO: Intel GPU (Arc / Iris Xe) が利用可能な場合は GPU、AMDやその他の場合は CPU を自動選択
+    - その他: 指定されたデバイス (GPU / NPU / CPU) を優先
+    """
+    req = requested_device.upper() if requested_device else "AUTO"
+    if req != "AUTO":
+        return req
+
+    try:
+        core = ov.Core()
+        available = core.available_devices
+
+        # GPU が存在する場合、Intel GPU かどうか判定
+        # (OpenVINO の GPU プラグインは Intel GPU 専用命令を含むため、AMD GPU ではエラーになる)
+        if "GPU" in available:
+            try:
+                gpu_name = core.get_property("GPU", "FULL_DEVICE_NAME").lower()
+                if "intel" in gpu_name:
+                    return "GPU"
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Intel GPU 以外（AMD Ryzen / Radeon 等）は CPU を自動選択
+    return "CPU"
+
+
+def get_device_display_name(device: str) -> str:
+    """デバイスの詳細表示名を取得 (例: GPU [Intel(R) Arc(TM) Graphics 140V] / CPU [AMD Ryzen 7 7735HS])"""
+    try:
+        core = ov.Core()
+        full_name = core.get_property(device, "FULL_DEVICE_NAME").strip()
+        return f"{device} ({full_name})"
+    except Exception:
+        return device
 
 
 def extract_audio_from_video(video_path: str, output_wav_path: str) -> str:
@@ -73,16 +116,20 @@ def format_timestamp(seconds: float) -> str:
 def transcribe_audio(
     wav_path: str,
     model_id: str = "OpenVINO/whisper-large-v3-turbo-fp16-ov",
-    device: str = "GPU",
+    device: str = "AUTO",
     chunk_seconds: int = 30,
     language: str = "<|ja|>"
 ):
     """
     OpenVINO WhisperPipeline による文字起こし処理
     """
+    target_device = resolve_device(device)
+    device_display = get_device_display_name(target_device)
+
     print(f"[2/4] OpenVINO Whisper モデルの準備中...")
     print(f"      - モデル: {model_id}")
-    print(f"      - デバイス: {device} (Intel Core Ultra)")
+    print(f"      - 指定デバイス: {device}")
+    print(f"      - 推論実行デバイス: {device_display}")
     
     # 1. モデルのダウンロード / キャッシュ確認
     try:
@@ -95,9 +142,20 @@ def transcribe_audio(
         model_dir = snapshot_download(repo_id=fallback_model)
 
     # 2. OpenVINO WhisperPipeline の初期化
-    print(f"      - OpenVINO パイプラインを初期化中 ({device})...")
+    print(f"      - OpenVINO パイプラインを初期化中 ({target_device})...")
     start_init = time.time()
-    pipe = ov_genai.WhisperPipeline(model_dir, device)
+    try:
+        pipe = ov_genai.WhisperPipeline(model_dir, target_device)
+    except Exception as e:
+        if target_device != "CPU":
+            print(f"\n[注意] {target_device} での初期化に失敗しました ({e})。")
+            print("       CPU にフォールバックして再初期化します...")
+            target_device = "CPU"
+            device_display = get_device_display_name("CPU")
+            print(f"      - フォールバック実行デバイス: {device_display}")
+            pipe = ov_genai.WhisperPipeline(model_dir, "CPU")
+        else:
+            raise
     init_time = time.time() - start_init
     print(f"   -> パイプライン初期化完了 ({init_time:.2f} 秒)")
 
@@ -159,10 +217,10 @@ def transcribe_audio(
     rtf = elapsed / total_seconds if total_seconds > 0 else 0
     print(f"\n   -> 文字起こし完了! (処理時間: {elapsed:.2f} 秒, Real Time Factor: {rtf:.2f}x)")
     
-    return transcripts, total_seconds, elapsed
+    return transcripts, total_seconds, elapsed, device_display
 
 
-def save_results(transcripts, input_video_path, output_txt_path=None):
+def save_results(transcripts, input_video_path, output_txt_path=None, device_display=""):
     """
     結果をテキストファイルおよび NotebookLM 向け Markdown ファイルとして保存
     """
@@ -183,6 +241,8 @@ def save_results(transcripts, input_video_path, output_txt_path=None):
     with open(output_md_path, "w", encoding="utf-8") as f:
         f.write(f"# 動画文字起こしノート\n\n")
         f.write(f"- **元ファイル**: `{os.path.basename(input_video_path)}`\n")
+        if device_display:
+            f.write(f"- **実行環境**: `{device_display}`\n")
         f.write(f"- **文字起こし日時**: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write(f"## タイムスタンプ付き文字起こし本文\n\n")
         for item in transcripts:
@@ -195,11 +255,11 @@ def save_results(transcripts, input_video_path, output_txt_path=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Intel Core Ultra Local AI (OpenVINO) を使った MP4 動画文字起こしツール"
+        description="Local AI (OpenVINO) を使った MP4 動画/音声文字起こしツール (Intel Core Ultra & AMD Ryzen 両対応)"
     )
     parser.add_argument("input_file", type=str, nargs="?", help="文字起こし対象の動画/音声ファイル (例: meeting.mp4)")
-    parser.add_argument("-d", "--device", type=str, default="GPU", choices=["GPU", "NPU", "CPU", "AUTO"],
-                        help="推論を実行する OpenVINO デバイス (デフォルト: GPU)")
+    parser.add_argument("-d", "--device", type=str, default="AUTO", choices=["AUTO", "GPU", "NPU", "CPU"],
+                        help="推論を実行するデバイス (デフォルト: AUTO - Intel GPU検出時はGPU、AMD/その他環境ではCPUを自動選択)")
     parser.add_argument("-m", "--model", type=str, default="OpenVINO/whisper-large-v3-turbo-fp16-ov",
                         help="使用する OpenVINO Whisper モデル ID (デフォルト: OpenVINO/whisper-large-v3-turbo-fp16-ov)")
     parser.add_argument("-o", "--output", type=str, default=None, help="出力テキストファイルのパス")
@@ -210,7 +270,10 @@ def main():
     # 引数なしで起動された場合のインタラクティブモード
     input_file = args.input_file
     if not input_file:
-        print("=== Intel Core Ultra (OpenVINO) Whisper 文字起こしアプリ ===")
+        detected_device = resolve_device(args.device)
+        print("=== Local AI (OpenVINO) Whisper 文字起こしアプリ ===")
+        print(f"環境検出: {get_device_display_name(detected_device)}")
+        print("Intel Core Ultra (Arc GPU/NPU) & AMD Ryzen (マルチコア CPU) に対応しています。\n")
         input_file = input("動画または音声ファイルのパスを入力してください (例: video.mp4): ").strip('"\'')
         if not input_file:
             print("エラー: ファイルが指定されていません。")
@@ -228,7 +291,7 @@ def main():
         extract_audio_from_video(input_file, temp_wav)
 
         # 2. 文字起こし
-        transcripts, total_sec, elapsed = transcribe_audio(
+        transcripts, total_sec, elapsed, dev_name = transcribe_audio(
             wav_path=temp_wav,
             model_id=args.model,
             device=args.device,
@@ -236,7 +299,7 @@ def main():
         )
 
         # 3. 結果の保存
-        save_results(transcripts, input_file, args.output)
+        save_results(transcripts, input_file, args.output, device_display=dev_name)
 
         print("\n=== 文字起こし処理が正常に完了しました！ ===")
         print("このファイルを NotebookLM または Gemini にアップロードして、議事録や要約を作成してください。")
